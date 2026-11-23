@@ -61,6 +61,11 @@ to a task that has already run.
 
             res = self.dep_manager.get_status(task, tasks)
 
+            if res.status == 'error':
+                write("failed {} ({})\n".format(
+                    task.name, res.get_error_message()))
+                continue
+
             # An 'up-to-date' status means that it is useless to recompute the
             # state: file deps and targets exists, the state has not changed,
             # there is nothing more to do.
@@ -69,7 +74,8 @@ to a task that has already run.
                 continue
 
             task.values = values
-            self.dep_manager.save_success(task, result_hash=result)
+            self.dep_manager.save_success(
+                task, result_hash=result, glob_state=task.glob_state)
             write("processed {}\n".format(task.name))
 
         self.dep_manager.close()

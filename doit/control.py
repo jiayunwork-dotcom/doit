@@ -7,6 +7,7 @@ import re
 from .exceptions import InvalidTask, InvalidCommand, InvalidDodoFile
 from .task import Task, DelayedLoaded
 from .loader import generate_tasks
+from .globdep import match_target
 
 
 class RegexGroup(object):
@@ -113,6 +114,30 @@ class TaskControl(object):
         #       from another previously created task.
         for task in task_list:
             TaskControl.add_implicit_task_dep(targets, task, task.file_dep)
+            TaskControl.add_glob_implicit_task_dep(targets, task)
+
+    @staticmethod
+    def add_glob_implicit_task_dep(targets, task):
+        """add implicit task_dep for a target matched by a glob_dep pattern.
+
+        Pattern membership is resolved lexically here (potential producers),
+        independently from what exists on disk: a consumer must wait for the
+        producer even before the produced file is created.  Paths are compared
+        through the same lexical normalization used when scanning, so
+        ``./x``, ``a/../x`` and absolute spellings do not miss each other.
+        Symbolic links are not resolved.
+        """
+        if not task.glob_dep:
+            return
+        for target, producer in targets.items():
+            if producer == task.name:
+                continue
+            if producer in task.task_dep:
+                continue
+            for pattern in task.glob_dep:
+                if match_target(pattern, target):
+                    task.task_dep.append(producer)
+                    break
 
 
     @staticmethod
@@ -479,6 +504,7 @@ class TaskDispatcher(object):
             # check itself for implicit dep (used by regex_target)
             TaskControl.add_implicit_task_dep(
                 self.targets, this_task, this_task.file_dep)
+            TaskControl.add_glob_implicit_task_dep(self.targets, this_task)
 
             # remove file_dep since generated tasks are not required
             # to really create the target (support multiple matches)
@@ -596,6 +622,7 @@ class TaskDispatcher(object):
         TaskControl.add_implicit_task_dep(
             self.targets, waiting_node.task,
             values.get('file_dep', []))
+        TaskControl.add_glob_implicit_task_dep(self.targets, waiting_node.task)
 
         # update node's list of non-processed dependencies
         new_task_dep = waiting_node.task.task_dep[len_task_deps:]

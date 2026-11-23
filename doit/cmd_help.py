@@ -27,6 +27,17 @@ file_dep:
   - type: list. items:
     * file (string) path relative to the dodo file
 
+glob_dep:
+  - type: list/tuple of non-empty strings (same string rule as file_dep)
+  - each item is a glob pattern relative to the current working directory
+  - supports * ? [] and recursive ** (same syntax as python glob)
+  - matches regular files only; directory symlinks are not followed and
+    a matched file symlink is an error
+  - matched files are used as file dependencies; the actual list is injected
+    in python-actions and CmdAction string formatting as `dependencies`
+  - a target declared by another task that would be matched by a pattern
+    makes that task an implicit task_dep even before the target exists
+
 task_dep:
   - type: list. items:
     * task name (string)

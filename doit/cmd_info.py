@@ -40,6 +40,7 @@ class Info(DoitCmdBase):
         task = tasks[task_name]
         task_attrs = (
             ('file_dep', 'list'),
+            ('glob_dep', 'list'),
             ('task_dep', 'list'),
             ('setup_tasks', 'list'),
             ('calc_dep', 'list'),
@@ -81,22 +82,28 @@ class Info(DoitCmdBase):
                 else:
                     printer.pprint(getattr(task, attr))
 
+        if task.glob_files:
+            self.outstream.write('\n{:11s}: '.format('glob_files'))
+            self.outstream.write('\n')
+            for val in task.glob_files:
+                self.outstream.write(' - {}\n'.format(val))
+
         return retcode
 
     @staticmethod
     def get_reasons(reasons):
         '''return string with description of reason task is not up-to-date'''
         lines = []
-        if reasons['has_no_dependencies']:
+        if reasons.get('has_no_dependencies'):
             lines.append(' * The task has no dependencies.')
 
-        if reasons['uptodate_false']:
+        if reasons.get('uptodate_false'):
             lines.append(' * The following uptodate objects evaluate to false:')
             for utd, utd_args, utd_kwargs in reasons['uptodate_false']:
                 msg = '    - {} (args={}, kwargs={})'
                 lines.append(msg.format(utd, utd_args, utd_kwargs))
 
-        if reasons['checker_changed']:
+        if reasons.get('checker_changed'):
             msg = ' * The file_dep checker changed from {0} to {1}.'
             lines.append(msg.format(*reasons['checker_changed']))
 
@@ -106,6 +113,9 @@ class Info(DoitCmdBase):
             'missing_file_dep': 'The following file dependencies are missing:',
             'removed_file_dep': 'The following file dependencies were removed:',
             'added_file_dep': 'The following file dependencies were added:',
+            'glob_dep_added': 'The following glob_dep files were added:',
+            'glob_dep_removed': 'The following glob_dep files were removed:',
+            'glob_dep_changed': 'The following glob_dep files have changed:',
         }
         for reason, sentence in sentences.items():
             entries = reasons.get(reason)
@@ -113,4 +123,16 @@ class Info(DoitCmdBase):
                 lines.append(' * {}'.format(sentence))
                 for item in entries:
                     lines.append('    - {}'.format(item))
+
+        if reasons.get('glob_dep_new'):
+            lines.append(' * glob_dep has no saved state yet; it will be '
+                         'computed once.')
+        if reasons.get('glob_dep_patterns_changed'):
+            info = reasons['glob_dep_patterns_changed']
+            lines.append(' * The glob_dep patterns changed from {} to {}.'
+                         .format(info['previous'], info['current']))
+        if reasons.get('glob_dep_error'):
+            lines.append(' * glob_dep could not be scanned:')
+            for item in reasons['glob_dep_error']:
+                lines.append('    - {}'.format(item))
         return '\n'.join(lines)

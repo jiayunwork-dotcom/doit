@@ -10,6 +10,8 @@ import cloudpickle
 from .exceptions import InvalidTask, BaseFail
 from .exceptions import TaskFailed, SetupError, DependencyError, UnmetDependency
 from .task import Stream, DelayedLoaded
+from .dependency import GlobDependencyChanged, observe_glob_state
+from .globdep import GlobError
 
 
 # execution result.
@@ -47,6 +49,9 @@ class Runner():
         self.teardown_list = []  # list of tasks to be teardown
         self.final_result = SUCCESS  # until something fails
         self._stop_running = False
+        # True inside a worker process/thread.  There the selection-time scan
+        # done by the main process is stale and must not be attested.
+        self._in_worker = False
 
 
     def _handle_task_error(self, node, base_fail):
@@ -166,14 +171,47 @@ class Runner():
 
 
     def execute_task(self, task):
-        """execute task's actions"""
+        """execute task's actions
+
+        For tasks using ``glob_dep`` this takes the start observation (the
+        exact input set the actions consume) before the actions and an end
+        observation right after them, **in the process that runs the
+        actions**.  If the two differ the returned failure marks the run as
+        invalid so no success record is saved.  The start observation is kept
+        on the task; the main process never re-scans to build a success
+        record.
+        """
         # register cleanup/teardown
         if task.teardown:
             self.teardown_list.append(task)
 
+        if task.glob_dep and (self._in_worker or task.setup_tasks
+                              or task.glob_state is None):
+            # Take a start observation right before the actions.  In the
+            # serial runner without setup tasks, get_status() has just
+            # observed and its result is reused, so an executed task costs
+            # two scans overall (start and end).  In a worker process the
+            # main process' selection-time scan is stale, and with setup
+            # tasks matched files may have appeared, so both take a fresh
+            # one here.
+            try:
+                task.set_glob_observation(observe_glob_state(task.glob_dep))
+            except GlobError as exception:
+                return DependencyError(
+                    "ERROR: Task '{}' reading glob_dep: {}".format(
+                        task.name, exception))
+
         # finally execute it!
         self.reporter.execute_task(task)
-        return task.execute(self.stream)
+        base_fail = task.execute(self.stream)
+
+        if task.glob_dep and base_fail is None:
+            try:
+                self.dep_manager.verify_glob_unchanged(task, task.glob_state)
+            except GlobDependencyChanged as exception:
+                return DependencyError(
+                    "ERROR: Task '{}': {}".format(task.name, exception))
+        return base_fail
 
 
     def process_task_result(self, node, base_fail):
@@ -182,8 +220,13 @@ class Runner():
         # save execution successful
         if base_fail is None:
             task.save_extra_values()
+            # The start/end comparison for glob_dep was already performed by
+            # execute_task() in the process that ran the actions.  Only the
+            # start observation is persisted: the newer content observed at
+            # the end can never be recorded as "processed".
             try:
-                self.dep_manager.save_success(task)
+                self.dep_manager.save_success(task,
+                                              glob_state=task.glob_state)
             except FileNotFoundError as exception:
                 msg = (f"ERROR: Task '{task.name}' saving success: "
                        f"Dependent file '{exception.filename}' does not exist.")
@@ -509,6 +552,7 @@ class MRunner(Runner):
             * JobTask / JobTaskPickle task to be executed
         """
         self.result_q = result_q
+        self._in_worker = True
         if self.Child == Process:
             self.reporter = MReporter(self, reporter_class)
         try:

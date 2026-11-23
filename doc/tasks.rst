@@ -364,6 +364,123 @@ Traditional build-tools can only handle files as "dependencies".
    than it actually used to execute the task.
 
 
+.. _glob-dep:
+
+glob_dep (pattern file dependency)
+----------------------------------
+
+When the set of input files is dynamic (for example, partitions that are
+created and deleted every day), list glob patterns in ``glob_dep`` instead of
+spelling out every path in ``file_dep``.  Patterns are expanded at run time,
+right before the task actions start, so partitions produced by a previous task
+in the same run are picked up.
+
+.. code-block:: python
+
+   def task_merge():
+       return {
+           'actions': [merge],
+           'glob_dep': ['landing/**/*.csv'],
+           'targets': ['merged.txt'],
+       }
+
+A complete example, including a producer of partitions:
+
+.. literalinclude:: samples/glob_dep.py
+
+Rules:
+
+ * ``glob_dep`` is a list or tuple of non-empty strings.  When omitted it is
+   equivalent to an empty list.  Elements follow ``file_dep``'s string rule.
+ * Patterns are interpreted relative to the current working directory and use
+   the same syntax as Python's :mod:`glob`: ``*``, ``?``, ``[]`` and the
+   recursive ``**``.
+ * Only **regular files** are matched.  Directory symbolic links are never
+   followed.  A matched file that is a symbolic link is an error (some runs
+   would otherwise read the link target while others only recorded the
+   directory entry).
+ * The same path matched by several patterns counts once.  Patterns are
+   de-duplicated by their declaration.
+ * An empty match is a valid empty set, and the patterns are still stored so a
+   file added later is discovered next run.
+ * ``file_dep`` may be used together with ``glob_dep``; a missing explicit
+   ``file_dep`` still raises the usual error.
+
+How the match set is decided
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The stored state of a task contains three things: the declared patterns, the
+sorted list of matched paths, and a content digest (MD5) for each matched file.
+A task runs again when any of these changes:
+
+ * the declared patterns changed,
+ * a matched file was added, removed or renamed,
+ * the content of a matched file changed.
+
+Content is always compared, even when file size and mtime are unchanged; a
+change that keeps size and restores mtime is still detected.  Conversely, a
+file whose bytes did not change is up-to-date even if only its mtime moved.
+Files are read in chunks, so memory does not grow with file size, and each
+unique path is hashed at most once per observation even with overlapping
+patterns.
+
+.. note::
+
+   Explicit ``file_dep`` entries keep their usual checker (``md5`` or
+   ``timestamp``).  The stronger always-compare-content guarantee applies to
+   files discovered through ``glob_dep``.
+
+Cost
+~~~~
+
+The stored observation is the sorted list of matched paths plus one MD5 per
+path (a manifest), and it does not keep file contents.  Resident memory is
+therefore proportional to the number of matched paths, never to the total
+number of bytes; deterministic chunked hashing keeps a single large file from
+being read into memory.  Each unique (normalized) path is hashed at most once
+per observation even when several patterns overlap.  Two observations are made
+for a task that runs: one immediately before its actions and one immediately
+after, to detect inputs that changed mid-run.
+
+Inputs handed to actions
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Python actions receive the actual files in the ``dependencies`` argument, and
+``CmdAction`` string formatting can use ``%(dependencies)s``.  The list is the
+union of the explicit ``file_dep`` and the current ``glob_dep`` matches,
+sorted by normalized path.  It never contains targets that have not been
+produced yet, and it does not modify the task's ``file_dep``.
+
+Producers of potential targets
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``glob_dep`` pattern also participates in graph construction.  If a declared
+``targets`` path of another task would be matched by one of the patterns, that
+task becomes an implicit ``task_dep`` even before the target file exists.  The
+producer runs first, then the consumer's actual match set is observed.
+
+Paths are compared with the same lexical normalization used for scanning, so
+``./x``, ``a/../x`` and absolute spellings all refer to the same file.
+Symbolic links are not resolved for this comparison.  Only producers in the
+same loaded static task graph are considered; existing cycle detection and
+"shared producer runs once" behaviour are preserved.
+
+Failure behaviour
+~~~~~~~~~~~~~~~~~
+
+If a file is added, removed, renamed or rewritten while the actions are
+running, the run is reported as a ``DependencyError`` even if the actions
+returned success, and no success record is saved.  The next legal run
+recomputes.  A failed action likewise never advances the success record.
+Directory scan or file read errors are reported as errors, never treated as
+"nothing changed".
+
+To re-run after changing inputs, simply run ``doit`` again (or use
+``doit forget <task>`` / ``doit reset-dep <task>``).  ``doit info <task>``
+reports whether the task is up to date and why (pattern change, added/removed
+members or content changes).
+
+
 targets
 -------
 
@@ -415,9 +532,14 @@ executed in the correct order.
 
 .. note::
 
-  `doit` compares the path (string) of the file of `file_dep` and `targets`.
+  For ``file_dep``/``targets`` `doit` compares the path (string) of the file.
   So although `my_file` and `./my_file` are actually the same file, `doit`
   will think they are different files.
+
+  For ``glob_dep`` the comparison is done on lexically normalized absolute
+  paths (``abspath`` + ``normpath``, without resolving symbolic links), so
+  ``./my_file``, ``a/../my_file`` and an absolute spelling produced by a
+  pattern do refer to the same file.
 
 
 .. _task-selection:

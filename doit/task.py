@@ -12,6 +12,7 @@ from .cmdparse import CmdOption, TaskParse
 from .exceptions import BaseFail, InvalidTask
 from .action import create_action, PythonAction
 from .dependency import UptodateCalculator
+from .globdep import normalize_patterns, normalize_path
 
 
 def first_line(doc):
@@ -116,6 +117,11 @@ class Task(object):
     @ivar task_dep: (list - string)
     @ivar wild_dep: (list - string) task dependency using wildcard *
     @ivar file_dep: (set - string)
+    @ivar glob_dep: (tuple - string) glob patterns matched at run time
+    @ivar glob_state: (GlobState) last observation of glob_dep (patterns,
+          matched files and content manifest). ``None`` until observed.
+    @ivar glob_files: (tuple - string) normalized absolute files matched by
+          glob_dep on the last observation. ``None`` until observed.
     @ivar calc_dep: (set - string) reference to a task
     @ivar dep_changed (list - string): list of file-dependencies that changed
           (are not up_to_date). this must be set before
@@ -149,6 +155,7 @@ class Task(object):
                   'name': (string_types, ()),
                   'actions': ((list, tuple), (None,)),
                   'file_dep': ((list, tuple), ()),
+                  'glob_dep': ((list, tuple), ()),
                   'task_dep': ((list, tuple), ()),
                   'uptodate': ((list, tuple), ()),
                   'calc_dep': ((list, tuple), ()),
@@ -174,7 +181,7 @@ class Task(object):
                  subtask_of=None, has_subtask=False,
                  doc=None, params=(), pos_arg=None,
                  verbosity=None, io=None, title=None, getargs=None,
-                 watch=(), meta=None, loader=None):
+                 watch=(), meta=None, loader=None, glob_dep=()):
         """sanity checks and initialization
 
         @param params: (list of dict for parameters) see cmdparse.CmdOption
@@ -184,6 +191,7 @@ class Task(object):
         self.check_attr(name, 'name', name, self.valid_attr['name'])
         self.check_attr(name, 'actions', actions, self.valid_attr['actions'])
         self.check_attr(name, 'file_dep', file_dep, self.valid_attr['file_dep'])
+        self.check_attr(name, 'glob_dep', glob_dep, self.valid_attr['glob_dep'])
         self.check_attr(name, 'task_dep', task_dep, self.valid_attr['task_dep'])
         self.check_attr(name, 'uptodate', uptodate, self.valid_attr['uptodate'])
         self.check_attr(name, 'calc_dep', calc_dep, self.valid_attr['calc_dep'])
@@ -220,7 +228,7 @@ class Task(object):
         else:
             self._actions = list(actions[:])
 
-        self._init_deps(file_dep, task_dep, calc_dep)
+        self._init_deps(file_dep, task_dep, calc_dep, glob_dep)
 
         # loaders create an implicity task_dep
         self.loader = loader
@@ -261,13 +269,20 @@ class Task(object):
         self.executed = False
 
 
-    def _init_deps(self, file_dep, task_dep, calc_dep):
+    def _init_deps(self, file_dep, task_dep, calc_dep, glob_dep=()):
         """init for dependency related attributes"""
         self.dep_changed = None
 
         # file_dep
         self.file_dep = set()
         self._expand_file_dep(file_dep)
+
+        # glob_dep
+        self.glob_dep = ()
+        self.glob_state = None  # last observation
+        self.glob_files = None  # last actual match set (sorted tuple)
+        if glob_dep:
+            self._expand_glob_dep(glob_dep)
 
         # task_dep
         self.task_dep = []
@@ -336,6 +351,22 @@ class Task(object):
                 raise InvalidTask(msg % (self.name, dep, type(dep)))
 
 
+    def _expand_glob_dep(self, glob_dep):
+        """put input into glob_dep (validated, de-duplicated, order kept)"""
+        combined = list(self.glob_dep)
+        for pattern in glob_dep:
+            if not isinstance(pattern, str):
+                msg = ("%s. glob_dep must be a list/tuple of strings. "
+                       "Got '%r' (%s)")
+                raise InvalidTask(msg % (self.name, pattern, type(pattern)))
+            if not pattern:
+                msg = ("%s. glob_dep patterns must be non-empty strings. "
+                       "Got '%r'.")
+                raise InvalidTask(msg % (self.name, pattern))
+            combined.append(pattern)
+        self.glob_dep = normalize_patterns(combined)
+
+
     def _expand_task_dep(self, task_dep):
         """convert task_dep input into actaul task_dep and wild_dep"""
         for dep in task_dep:
@@ -361,6 +392,7 @@ class Task(object):
     _expand_map = {
         'task_dep': _expand_task_dep,
         'file_dep': _expand_file_dep,
+        'glob_dep': _expand_glob_dep,
         'calc_dep': _expand_calc_dep,
         'uptodate': _extend_uptodate,
     }
@@ -453,6 +485,33 @@ class Task(object):
                 create_action(a, self, 'actions') for a in self._actions]
         return self._action_instances
 
+
+    @property
+    def actual_dependencies(self):
+        """Input files this run actually consumes.
+
+        Union of explicitly declared ``file_dep`` and the files matched by
+        ``glob_dep`` on the current observation.  Paths are normalized and
+        sorted; the user's ``file_dep`` set is not modified.  Candidates that
+        have not been produced yet are never included: only files that were
+        actually observed on disk.
+
+        For tasks without ``glob_dep`` this is exactly ``list(file_dep)``,
+        preserving the historical ``dependencies`` value.
+        """
+        if not self.glob_files:
+            return list(self.file_dep)
+        merged = {}
+        for dep in self.file_dep:
+            merged[normalize_path(dep)] = dep
+        for path in self.glob_files:
+            merged.setdefault(path, path)
+        return [merged[key] for key in sorted(merged)]
+
+    def set_glob_observation(self, state):
+        """store a glob observation (state is a globdep.GlobState)"""
+        self.glob_state = state
+        self.glob_files = state.files if state is not None else None
 
     def save_extra_values(self):
         """run value_savers updating self.values"""

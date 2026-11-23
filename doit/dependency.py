@@ -9,6 +9,10 @@ from collections import defaultdict
 from dbm import dumb
 import dbm as ddbm
 
+from .globdep import (
+    GlobError, GlobState, manifest_diff, normalize_path, scan_state,
+)
+
 # uncomment imports below to run tests on all dbm backends...
 # import dumbdbm as ddbm
 # import dbm as ddbm
@@ -22,6 +26,20 @@ import dbm as ddbm
 class DatabaseException(Exception):
     """Exception class for whatever backend exception"""
     pass
+
+
+class GlobDependencyChanged(Exception):
+    """A glob_dep input changed while the task actions were running.
+
+    The success record is not valid: the saved state would describe inputs the
+    action did not actually process.
+    """
+    pass
+
+
+# key used to persist glob_dep information inside a task's DB entry
+GLOB_DEP_KEY = 'glob_dep:'
+GLOB_DEP_VERSION = 1
 
 
 def get_md5(input_data):
@@ -45,6 +63,34 @@ def get_file_md5(path):
                 break
             md5.update(data)
     return md5.hexdigest()
+
+
+def glob_record(patterns, files, manifest):
+    """build the JSON-serializable record persisted for a glob_dep"""
+    return {
+        'version': GLOB_DEP_VERSION,
+        'patterns': list(patterns),
+        'files': list(files),
+        'manifest': dict(manifest),
+    }
+
+
+def glob_states_equal(start, end):
+    """compare two GlobState values by declaration + membership + content.
+
+    Directory enumeration order is irrelevant because files are sorted and the
+    manifest is a mapping.
+    """
+    return (tuple(start.patterns) == tuple(end.patterns)
+            and tuple(start.files) == tuple(end.files)
+            and start.manifest == end.manifest)
+
+
+def observe_glob_state(patterns):
+    """Observe `patterns`; empty declaration yields an empty actual set."""
+    if patterns:
+        return scan_state(patterns)
+    return GlobState(patterns=(), files=(), manifest={})
 
 
 class JSONCodec():
@@ -496,6 +542,7 @@ class Dependency(object):
     * ``ignore:``
     * ``deps:``
     * ``checker:``
+    * ``glob_dep:`` (glob_dep declaration, matched files and content manifest)
 
     Those can be accessed with generic DB ``get()``, see below...
 
@@ -524,10 +571,16 @@ class Dependency(object):
 
     ####### task specific
 
-    def save_success(self, task, result_hash=None):
+    def save_success(self, task, result_hash=None, glob_state=None):
         """save info after a task is successfully executed
 
         :param str result_hash: explicitly set result_hash
+        :param glob_state: (GlobState) the observation of the inputs that the
+            task actually started processing. When given it is persisted
+            verbatim; it is never replaced by a newer scan. ``None`` means
+            "use the last observation made for this task" (or scan now when
+            there is none), which is what direct users of ``save_success``
+            (i.e. ``reset-dep``, tests) need.
         """
         # save task values
         self._set(task.name, "_values_:", task.values)
@@ -550,6 +603,124 @@ class Dependency(object):
 
         # save list of file_deps
         self._set(task.name, 'deps:', tuple(task.file_dep))
+
+        # glob-dep
+        if glob_state is None:
+            if task.glob_state is not None:
+                glob_state = task.glob_state
+            elif task.glob_dep:
+                glob_state = self.observe_glob(task)
+        if glob_state is not None:
+            self._save_glob_record(task, glob_state)
+        elif not task.glob_dep and self._get(task.name, GLOB_DEP_KEY):
+            # glob_dep declaration was removed: drop stale pattern info
+            self._set(task.name, GLOB_DEP_KEY, None)
+
+    def _save_glob_record(self, task, glob_state):
+        """persist (or clear) the glob_dep record of a task"""
+        if not glob_state.patterns:
+            # no glob declaration (or it was removed): make sure a stale
+            # record is not kept around.
+            self._set(task.name, GLOB_DEP_KEY, None)
+        else:
+            self._set(task.name, GLOB_DEP_KEY,
+                      glob_record(glob_state.patterns, glob_state.files,
+                                  glob_state.manifest))
+
+    def observe_glob(self, task):
+        """Scan the task's glob_dep and store the observation on the task.
+
+        This is one of the two observations that make the strong content
+        guarantee (the other is taken after the actions ran).  It also
+        provides the actual file list injected into actions as
+        ``dependencies``.
+        """
+        if task.glob_dep:
+            state = scan_state(task.glob_dep)
+        else:
+            state = GlobState(patterns=(), files=(), manifest={})
+        task.glob_state = state
+        task.glob_files = state.files
+        return state
+
+    def _glob_status(self, task, state, result, get_log):
+        """Evaluate `state` against the persisted glob_dep record.
+
+        The state is the start observation (already made).  Records reasons on
+        `result`; returns ``(added, removed, changed)`` lists.
+        """
+        previous = self._get(task.name, GLOB_DEP_KEY)
+        changes = {'added': [], 'removed': [], 'changed': []}
+        if state is None:
+            return changes
+
+        if not previous:
+            # old database entry (or first run) without pattern information:
+            # trigger exactly one computation rather than trusting `deps:`.
+            if task.glob_dep:
+                result.set_reason('glob_dep_new', list(task.glob_dep))
+            return changes
+
+        prev_patterns = tuple(previous.get('patterns', ()))
+        prev_files = tuple(previous.get('files', ()))
+        prev_manifest = previous.get('manifest') or {}
+        added, removed, changed = manifest_diff(prev_manifest, state.manifest)
+        # membership can not change without the manifest changing, but be
+        # defensive in case an old record was stored without a manifest.
+        added = sorted(set(added) | (set(state.files) - set(prev_files)))
+        removed = sorted(set(removed) | (set(prev_files) - set(state.files)))
+        changes = {'added': added, 'removed': removed, 'changed': changed}
+
+        patterns_changed = prev_patterns != tuple(task.glob_dep)
+        if patterns_changed:
+            result.set_reason('glob_dep_patterns_changed',
+                              {'previous': list(prev_patterns),
+                               'current': list(task.glob_dep)})
+
+        if patterns_changed or added or removed or changed:
+            result.status = 'run'
+            if get_log:
+                if added:
+                    result.set_reason('glob_dep_added', added)
+                if removed:
+                    result.set_reason('glob_dep_removed', removed)
+                if changed:
+                    result.set_reason('glob_dep_changed', changed)
+        return changes
+
+    def verify_glob_unchanged(self, task, start_state):
+        """Re-observe glob_dep after actions and compare with `start_state`.
+
+        :raises GlobDependencyChanged: if the visible input set/content changed
+            while the actions were running.  In that case the success record
+            must not be saved.
+        """
+        if start_state is None:
+            return
+        try:
+            end_state = observe_glob_state(task.glob_dep)
+        except GlobError as exc:
+            raise GlobDependencyChanged(
+                "Cannot re-read glob_dep inputs after task '{}' ran: {}".format(
+                    task.name, exc)) from exc
+        if glob_states_equal(start_state, end_state):
+            task.glob_state = end_state
+            return
+        added, removed, changed = manifest_diff(start_state.manifest,
+                                                end_state.manifest)
+        parts = []
+        if added:
+            parts.append("added: {}".format(", ".join(added)))
+        if removed:
+            parts.append("removed: {}".format(", ".join(removed)))
+        if changed:
+            parts.append("changed: {}".format(", ".join(changed)))
+        if not parts:
+            parts.append("the matched set no longer matches the declared patterns")
+        raise GlobDependencyChanged(
+            "glob_dep inputs of task '{}' changed while it was running ({}). "
+            "The success record is not valid; the task will run again.".format(
+                task.name, "; ".join(parts)))
 
     def get_values(self, task_name):
         """get all saved values from a task
@@ -613,6 +784,8 @@ class Dependency(object):
         """
         result = DependencyStatus(get_log)
         task.dep_changed = []
+        task.glob_state = None
+        task.glob_files = None
 
         # check uptodate bool/callables
         uptodate_result_list = []
@@ -652,12 +825,27 @@ class Dependency(object):
             if not uptodate_result:
                 result.add_reason('uptodate_false', (utd, utd_args, utd_kwargs))
 
-        # any uptodate check is false
+        # Check glob_dep first: it is the authoritative view of pattern-based
+        # inputs, it must not be downgraded to "nothing changed" on errors, and
+        # its actual file set feeds `dependencies` on the actions.
+        if not task.glob_dep and not self._get(task.name, GLOB_DEP_KEY):
+            glob_state = None
+        else:
+            try:
+                glob_state = self.observe_glob(task)
+            except GlobError as exc:
+                result.error_reason = str(exc)
+                result.add_reason('glob_dep_error', str(exc), 'error')
+                task.dep_changed = self._actual_inputs(task, None)
+                return result
+
+        # any uptodate check is false: run.  glob_dep was still observed above
+        # so the injected `dependencies` list is complete.
         if not get_log and result.status == 'run':
             return result
 
         # no dependencies means it is never up to date.
-        if not (task.file_dep or uptodate_result_list):
+        if not (task.file_dep or task.glob_dep or uptodate_result_list):
             if result.set_reason('has_no_dependencies', True):
                 return result
 
@@ -665,7 +853,7 @@ class Dependency(object):
         # if target file is not there, task is not up to date
         for targ in task.targets:
             if not self.checker.exists(targ):
-                task.dep_changed = list(task.file_dep)
+                task.dep_changed = self._status_inputs(glob_state, task)
                 if result.add_reason('missing_target', targ):
                     return result
 
@@ -673,7 +861,7 @@ class Dependency(object):
         previous = self._get(task.name, 'checker:')
         checker_name = self.checker.__class__.__name__
         if previous and previous != checker_name:
-            task.dep_changed = list(task.file_dep)
+            task.dep_changed = self._status_inputs(glob_state, task)
             # remove all saved values otherwise they might be re-used by
             # some optimization on MD5Checker.get_state()
             self.remove(task.name)
@@ -691,6 +879,9 @@ class Dependency(object):
                 result.set_reason('removed_file_dep', removed_files)
             result.status = 'run'
 
+        # check glob_dep membership / content
+        glob_changes = self._glob_status(task, glob_state, result, get_log)
+
         # list of file_dep that changed
         check_modified = self.checker.check_modified
         changed = []
@@ -706,12 +897,50 @@ class Dependency(object):
             else:
                 if state is None or check_modified(dep, file_stat, state):
                     changed.append(dep)
+
+        # glob_dep content changes are reported with their own reason, but
+        # they are also part of the `changed` value injected into actions.
+        for path in glob_changes['changed']:
+            if path not in changed:
+                changed.append(path)
+
         task.dep_changed = changed
 
-        if len(changed) > 0:
-            result.set_reason('changed_file_dep', changed)
+        # report changed explicit file_dep; glob content changes already have
+        # their own `glob_dep_changed` reason.
+        explicit_changed = [dep for dep in changed
+                            if dep in task.file_dep]
+        if len(explicit_changed) > 0:
+            result.set_reason('changed_file_dep', explicit_changed)
 
         return result
+
+    @staticmethod
+    def _actual_inputs(task, glob_state):
+        """Actual input list: explicit file_dep union current glob matches.
+
+        Sorted by normalized path and does not mutate ``task.file_dep``.
+        Candidates that have not been produced are *not* included.
+        """
+        explicit = {}
+        for dep in task.file_dep:
+            explicit[normalize_path(dep)] = dep
+        if glob_state is not None:
+            for path in glob_state.files:
+                explicit.setdefault(path, path)
+        return [explicit[key] for key in sorted(explicit)]
+
+    @staticmethod
+    def _status_inputs(glob_state, task):
+        """dep_changed payload used on early-exit reasons.
+
+        For tasks without glob_dep this is exactly ``list(task.file_dep)``
+        (legacy behaviour).  With glob_dep the actual matched files are
+        included so diagnostics report what was really observed.
+        """
+        if glob_state is None:
+            return list(task.file_dep)
+        return Dependency._actual_inputs(task, glob_state)
 
 
 

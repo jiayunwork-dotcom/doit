@@ -1,3 +1,5 @@
+import sys
+
 from .cmd_base import DoitCmdBase, check_tasks_exist, subtasks_iter
 
 opt_listall = {
@@ -97,8 +99,14 @@ class List(DoitCmdBase):
 
         # print dependencies
         if list_deps:
+            seen = set()
             for dep in task.file_dep:
+                seen.add(dep)
                 self.outstream.write(" -  %s\n" % dep)
+            if getattr(task, 'glob_files', None):
+                for dep in task.glob_files:
+                    if dep not in seen:
+                        self.outstream.write(" -  %s\n" % dep)
             self.outstream.write("\n")
 
     @staticmethod
@@ -161,6 +169,21 @@ class List(DoitCmdBase):
             print_list = sorted(print_list)
         elif sort == 'definition':
             pass  # task list is already sorted in order of definition
+
+        # discover glob_dep files only when they will be printed.  A scan
+        # error must not break `list`; it is reported on stderr.
+        if list_deps:
+            for task in print_list:
+                if not task.glob_dep or task.glob_files is not None:
+                    continue
+                try:
+                    task.set_glob_observation(
+                        self.dep_manager.observe_glob(task))
+                except Exception as exc:
+                    sys.stderr.write(
+                        "WARNING: Task '{}' glob_dep: {}\n".format(
+                            task.name, exc))
+                    task.glob_files = None
 
         # print list of tasks
         for task in print_list:

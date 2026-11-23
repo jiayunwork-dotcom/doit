@@ -10,6 +10,19 @@ Changes
 =======
 
 
+Unreleased
+==========
+
+- Add ``glob_dep``: pattern-based file dependencies expanded at run time.
+  Supports ``*``, ``?``, ``[]`` and recursive ``**``, regular files only,
+  directory symlinks are not followed and file symlinks are rejected.
+  Matched files participate in up-to-date checks (content compared even when
+  size/mtime are unchanged) and in graph construction: declared targets that
+  would match a pattern create an implicit ``task_dep`` on their producer.
+  The actual match set is injected as ``dependencies`` to actions.  Input
+  changes during a task run invalidate the success record.
+
+
 0.36.0 (*2022-04-22*)
 =====================
 

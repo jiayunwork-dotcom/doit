@@ -53,7 +53,7 @@ class BaseAction(object):
         meta_args = {
             'task': lambda: task,
             'targets': lambda: list(task.targets),
-            'dependencies': lambda: list(task.file_dep),
+            'dependencies': lambda: list(task.actual_dependencies),
             'changed': lambda: list(task.dep_changed),
         }
 
@@ -292,7 +292,7 @@ class CmdAction(BaseAction):
 
         subs_dict = {
             'targets': " ".join(self.task.targets),
-            'dependencies': " ".join(self.task.file_dep),
+            'dependencies': " ".join(self.task.actual_dependencies),
         }
 
         # dep_changed is set on get_status()
