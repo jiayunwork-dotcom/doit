@@ -13,6 +13,7 @@ from .exceptions import BaseFail, InvalidTask
 from .action import create_action, PythonAction
 from .dependency import UptodateCalculator
 from .globdep import normalize_patterns, normalize_path
+from .resources import validate_resources
 
 
 def first_line(doc):
@@ -171,7 +172,8 @@ class Task(object):
                   'getargs': ((dict,), ()),
                   'title': ((Callable,), (None,)),
                   'watch': ((list, tuple), ()),
-                  'meta': ((dict,), (None,))
+                  'meta': ((dict,), (None,)),
+                  'resources': ((dict,), (None,)),
                   }
 
 
@@ -181,7 +183,8 @@ class Task(object):
                  subtask_of=None, has_subtask=False,
                  doc=None, params=(), pos_arg=None,
                  verbosity=None, io=None, title=None, getargs=None,
-                 watch=(), meta=None, loader=None, glob_dep=()):
+                 watch=(), meta=None, loader=None, glob_dep=(),
+                 resources=None):
         """sanity checks and initialization
 
         @param params: (list of dict for parameters) see cmdparse.CmdOption
@@ -208,6 +211,8 @@ class Task(object):
         self.check_attr(name, 'title', title, self.valid_attr['title'])
         self.check_attr(name, 'watch', watch, self.valid_attr['watch'])
         self.check_attr(name, 'meta', meta, self.valid_attr['meta'])
+        self.check_attr(name, 'resources', resources,
+                        self.valid_attr['resources'])
 
         if '=' in name:
             msg = "Task '{}': name must not use the char '=' (equal sign)."
@@ -265,6 +270,8 @@ class Task(object):
         self.doc = self._init_doc(doc)
         self.watch = watch
         self.meta = meta
+        # validated copy; the caller's dict is never retained or mutated
+        self.resources = validate_resources(resources, name)
         # just indicate if actions were executed at all
         self.executed = False
 

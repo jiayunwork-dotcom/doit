@@ -12,6 +12,9 @@ from .exceptions import TaskFailed, SetupError, DependencyError, UnmetDependency
 from .task import Stream, DelayedLoaded
 from .dependency import GlobDependencyChanged, observe_glob_state
 from .globdep import GlobError
+from .resources import (
+    ResourceManager, DEFAULT_BYPASS_LIMIT,
+)
 
 
 # execution result.
@@ -32,13 +35,19 @@ class Runner():
 
     """
     def __init__(self, dep_manager, reporter, continue_=False,
-                 always_execute=False, stream=None):
+                 always_execute=False, stream=None,
+                 resource_limits=None,
+                 resource_bypass_limit=DEFAULT_BYPASS_LIMIT,
+                 resource_record_events=False):
         """
         @param dep_manager: DependencyBase
         @param reporter: reporter object to be used
         @param continue_: (bool) execute all tasks even after a task failure
         @param always_execute: (bool) execute even if up-to-date or ignored
         @param stream: (task.Stream) global verbosity
+        @param resource_limits: (dict) declared resource capacities
+        @param resource_bypass_limit: (int) max fairness bypasses per waiter
+        @param resource_record_events: (bool) keep admission diagnostics
         """
         self.dep_manager = dep_manager
         self.reporter = reporter
@@ -52,6 +61,24 @@ class Runner():
         # True inside a worker process/thread.  There the selection-time scan
         # done by the main process is stale and must not be attested.
         self._in_worker = False
+        # parent-side admission control / resource accounting.  A fresh
+        # manager per run means re-running in the same Python process starts
+        # from empty allocation and reset waiting counters.
+        self.resource_manager = ResourceManager(
+            resource_limits, resource_bypass_limit,
+            record_events=resource_record_events)
+
+    def _preflight_resources(self, task_dispatcher):
+        """reject statically loaded bad declarations before any action runs.
+
+        Delayed tasks do not exist yet; their declarations are validated as
+        they are admitted through ResourceManager.try_admit().
+        """
+        for task in task_dispatcher.tasks.values():
+            # delayed placeholders have no actions nor real declaration yet
+            if task.loader:
+                continue
+            self.resource_manager.validate_task(task)
 
 
     def _handle_task_error(self, node, base_fail):
@@ -248,20 +275,41 @@ class Runner():
         @param task_dispatcher: L{TaskDispacher}
         """
         node = None
+        manager = self.resource_manager
         while True:
             if self._stop_running:
                 break
 
-            try:
-                node = task_dispatcher.generator.send(node)
-            except StopIteration:
-                break
+            # a parked task whose capacity was released runs first; in serial
+            # mode there is no concurrent commitment so this is normally a
+            # no-op, but it keeps the admission logic identical across the
+            # serial and parallel runners.
+            parked = manager.pump()
+            if parked is not None:
+                node = parked
+            else:
+                try:
+                    node = task_dispatcher.generator.send(node)
+                except StopIteration:
+                    break
 
             if not self.select_task(node, task_dispatcher.tasks):
                 continue
 
-            base_fail = self.execute_task(node.task)
-            self.process_task_result(node, base_fail)
+            if not manager.try_admit(node):
+                # unreachable in serial mode unless the manager state is
+                # inconsistent; parking is only meaningful with workers
+                raise RuntimeError(
+                    "task '{}' could not be admitted in serial mode".format(
+                        node.task.name))
+
+            # resources stay committed until the result (success, failure or
+            # a failure while saving it) is fully processed.
+            try:
+                base_fail = self.execute_task(node.task)
+                self.process_task_result(node, base_fail)
+            finally:
+                manager.release(node)
 
 
     def teardown(self):
@@ -294,6 +342,9 @@ class Runner():
             if hasattr(self.reporter, 'initialize'):
                 self.reporter.initialize(task_dispatcher.tasks,
                                          task_dispatcher.selected_tasks)
+            # reject invalid static resource declarations before any action
+            # or setup task can run
+            self._preflight_resources(task_dispatcher)
             self.run_tasks(task_dispatcher)
         except InvalidTask as exception:
             self.reporter.runtime_error(str(exception))
@@ -385,9 +436,15 @@ class MRunner(Runner):
 
     def __init__(self, dep_manager, reporter,
                  continue_=False, always_execute=False,
-                 stream=None, num_process=1):
+                 stream=None, num_process=1,
+                 resource_limits=None,
+                 resource_bypass_limit=DEFAULT_BYPASS_LIMIT,
+                 resource_record_events=False):
         Runner.__init__(self, dep_manager, reporter, continue_=continue_,
-                        always_execute=always_execute, stream=stream)
+                        always_execute=always_execute, stream=stream,
+                        resource_limits=resource_limits,
+                        resource_bypass_limit=resource_bypass_limit,
+                        resource_record_events=resource_record_events)
         self.num_process = num_process
 
         self.free_proc = 0   # number of free process
@@ -404,39 +461,81 @@ class MRunner(Runner):
         pickle_dict['reporter'] = None
         pickle_dict['task_dispatcher'] = None
         pickle_dict['dep_manager'] = None
+        # resource accounting exists only in the parent process; workers
+        # never make admission decisions.  Removing it makes the object
+        # pickle-safe (threads/locks are not picklable) and makes accidental
+        # worker-side accounting fail loudly.
+        pickle_dict['resource_manager'] = None
         return pickle_dict
+
+    @staticmethod
+    def _job_for(task):
+        """build the job wrapper used to send a task to a worker"""
+        if task.loader is DelayedLoaded and MRunner.Child == Process:
+            return JobTask(task)
+        return JobTaskPickle(task)
 
     def get_next_job(self, completed):
         """get next task to be dispatched to sub-process
 
-        On MP needs to check if the dependencies finished its execution
+        On MP needs to check if the dependencies finished its execution and
+        whether the task's resource requirements can be committed.
         @returns : - None -> no more tasks to be executed
                    - JobXXX
         """
         if self._stop_running:
             return None  # gentle stop
+        manager = self.resource_manager
+
+        # The dispatcher generator stays the single source of dependency
+        # readiness: every completion is fed back into it (via `send`) so
+        # task-level waiters are woken exactly as in the resource-free
+        # flow.  Resource-parked nodes get their turn only once the
+        # dispatcher has nothing else dependency-ready, at "hold on" or
+        # exhaustion.  try_admit() still enforces capacity and fairness, so
+        # fresh nodes can never overtake a parked waiter unlawfully.
         node = completed
         while True:
-            # get next task from controller
             try:
                 node = self.task_dispatcher.generator.send(node)
                 if node == "hold on":
+                    parked = manager.pump()
+                    if parked is not None:
+                        return self._job_for(parked.task)
+                    # workers wait for dependencies or capacity; stopping is
+                    # handled at the top of the next call.
+                    if self._stop_running:
+                        return None
                     self.free_proc += 1
                     return JobHold()
             # no more tasks from controller...
             except StopIteration:
+                parked = manager.pump()
+                if parked is not None:
+                    return self._job_for(parked.task)
+                # keep the worker alive only if a parked task could still be
+                # revived: that requires a running task to eventually release
+                # capacity.  With no commitments the waiters are dead (their
+                # releasers failed or were skipped); when stopping they are
+                # abandoned as well.
+                if (manager.has_waiters() and manager.has_commitments()
+                        and not self._stop_running):
+                    self.free_proc += 1
+                    return JobHold()
                 # ... terminate one sub process if no other task waiting
                 return None
 
             # send a task to be executed
             if self.select_task(node, self.tasks):
-                # If sub-process already contains the Task object send
-                # only safe pickle data, otherwise send whole object.
-                task = node.task
-                if task.loader is DelayedLoaded and self.Child == Process:
-                    return JobTask(task)
-                else:
-                    return JobTaskPickle(task)
+                if manager.try_admit(node):
+                    return self._job_for(node.task)
+                # capacity/fairness parked it inside the manager.  Do not
+                # feed the node back into the dispatcher generator: it would
+                # then advance to a different node.  The parked node is
+                # owned solely by the ResourceManager and is revived via
+                # pump() when the dispatcher next reaches "hold on".
+                node = None
+                continue
 
 
     def _run_tasks_init(self, task_dispatcher):
@@ -512,7 +611,13 @@ class MRunner(Runner):
                 if 'reporter' in result:
                     getattr(self.reporter, result['reporter'])(task)
                     continue
-                self._process_result(node, task, result)
+                # free the capacity committed at dispatch time before asking
+                # for another job, whether the outcome is success, action
+                # failure or a failure saving the success record.
+                try:
+                    self._process_result(node, task, result)
+                finally:
+                    self.resource_manager.release(node)
 
                 # update num free process
                 free_proc = self.free_proc + 1
@@ -525,8 +630,13 @@ class MRunner(Runner):
                     if next_job is None:
                         proc_count -= 1
                     job_q.put(next_job)
-                # check for cyclic dependencies
-                assert len(proc_list) > self.free_proc
+                # Note: a worker may legitimately hold while every worker is
+                # parked on resource capacity, so free_proc can equal the
+                # worker count here.  Liveness is guaranteed because a
+                # release() pumps a parked task back into a slot, and
+                # get_next_job() returns None to terminate workers once the
+                # dispatcher is exhausted and no waiter can be revived
+                # (including when the run is stopping).
         except (SystemExit, KeyboardInterrupt, Exception):
             if self.Child == Process:
                 for proc in proc_list:

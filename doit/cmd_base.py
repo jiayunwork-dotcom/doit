@@ -12,6 +12,9 @@ from .dependency import CHECKERS, DbmDB, JsonDB, SqliteDB, Dependency, JSONCodec
 from .action import CmdAction
 from .plugin import PluginDict
 from . import loader
+from .resources import (
+    validate_resource_limits, validate_bypass_limit, DEFAULT_BYPASS_LIMIT,
+)
 
 
 def version_tuple(ver_in):
@@ -528,6 +531,23 @@ class DoitCmdBase(Command):
         params.update_defaults(dodo_config)
 
         self.check_minversion(params.get('minversion'))
+
+        # resource configuration is consumed by task-executing commands.
+        # Validate it here so malformed configuration aborts before any task
+        # is loaded or executed.  Omitted values are treated as their empty
+        # defaults; the caller's dictionaries are never mutated.
+        if self.execute_tasks:
+            resource_limits = validate_resource_limits(
+                params.get('resource_limits') or {})
+            bypass_limit = validate_bypass_limit(
+                params.get('resource_bypass_limit', DEFAULT_BYPASS_LIMIT))
+            # store validated copies for the run command
+            self._resource_limits = resource_limits
+            self._resource_bypass_limit = bypass_limit
+            # diagnostic opt-in; defaults to False and never changes the
+            # default reporter/output behavior
+            self._resource_record_events = bool(
+                params.get('resource_record_events', False))
 
         # set selected tasks for command
         self.sel_default_tasks = len(args) == 0

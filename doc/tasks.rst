@@ -481,6 +481,119 @@ reports whether the task is up to date and why (pattern change, added/removed
 members or content changes).
 
 
+.. _task-resources:
+
+resources (capacity-aware scheduling)
+-------------------------------------
+
+The ``-n`` option only limits *how many* tasks run at the same time; it cannot
+tell three light tasks from three heavy ones.  A task can instead declare how
+much of each named *resource* it needs, and the run declares each resource's
+capacity.  doit then admits tasks only when all of their requirements fit at
+once, while still letting smaller, independent tasks move ahead of a blocked
+heavy task within a fairness boundary.
+
+Declare requirements on the task dictionary.  Keys are non-empty resource
+names; values are non-negative integers (``bool`` is not accepted).  A value
+of ``0`` is allowed and occupies nothing.  Omitting ``resources`` is
+equivalent to an empty dictionary.
+
+.. code-block:: python
+
+    def task_partition():
+        return {
+            'actions': ['convert partition/*.raw'],
+            'resources': {'memory_slots': 3, 'db_connections': 1},
+        }
+
+Declare the capacities in ``DOIT_CONFIG``.  Capacities are positive integers;
+an empty dictionary (or omitting the option) means no resource has declared
+capacity.
+
+.. code-block:: python
+
+    DOIT_CONFIG = {
+        'resource_limits': {
+            'memory_slots': 8,
+            'db_connections': 4,
+        },
+        # optional, default 3; non-negative integer
+        'resource_bypass_limit': 3,
+    }
+
+Rules and errors
+~~~~~~~~~~~~~~~~
+
+* A positive requirement for a resource that has no declared
+  ``resource_limits`` entry, or a requirement larger than that resource's
+  capacity, aborts the run with a clear error.  Errors in the *statically
+  loaded* task graph are rejected before any action or setup task runs;
+  tasks created later by a delayed loader are checked when they are admitted.
+* The caller's dictionaries are validated into copies and never rewritten.
+* ``-n`` still independently caps the total number of simultaneously running
+  tasks.
+
+When capacity is committed and released
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Capacity is reserved in the parent process at the moment a task is *admitted*
+into the execution queue — not when a worker happens to start it — so tasks
+already dispatched but not yet started are correctly counted.  A task never
+holds part of its requirements while waiting for the rest (all-or-nothing).
+The reservation is released when the parent has finished processing the
+task's result, whether the outcome is success, an action failure, or a
+failure while saving the success record.
+
+Tasks that are up-to-date, ignored, or skipped because a dependency failed
+neither consume resources nor count as an admission.  Setup tasks are
+independent tasks that use their own requirements.  Teardown actions keep
+their existing execution model and do not participate in admission control.
+
+Fairness boundary
+~~~~~~~~~~~~~~~~~
+
+Waiters are ordered by when they entered the resource wait, which can only
+happen after all their task dependencies are ready; tasks whose dependencies
+are not ready never take a queue number early.
+
+If an earlier waiter ``A`` and a later task ``B`` share at least one resource
+with a positive requirement, admitting ``B`` first counts as one bypass of
+``A``.  Each waiter tolerates at most ``resource_bypass_limit`` such
+bypasses (the default is 3); once the budget is spent, later tasks sharing a
+resource with it can no longer jump ahead, which guarantees the heavy task a
+real chance at the capacity it needs.  One admission can bypass several
+waiters and is counted against each of them separately.  A limit of ``0``
+forbids any overlapping task from jumping the queue.
+
+Tasks whose requirements are completely disjoint from a waiting task neither
+consume its bypass budget nor are blocked by it, so unrelated work keeps
+flowing.  Because parked tasks hold no capacity while waiting, a circular
+wait (resource deadlock) cannot form.
+
+Serial, ``-n`` process and ``-n`` thread execution all use the same
+admission logic.  A failed run leaves nothing reserved: invoking
+``DoitMain`` again in the same Python process starts from empty allocation
+and fresh waiting counters.
+
+Diagnostics
+~~~~~~~~~~~
+
+``doit info <task>`` prints the task's ``resources`` declaration.  For
+programmatic inspection, the runner keeps a ``ResourceManager`` on
+``runner.resource_manager`` with:
+
+* ``snapshot()`` — current limits, committed allocation, running tasks and
+  waiting tasks together with each waiter's last reason
+  (``capacity`` or ``fairness: blocked by <task>``) and bypass count;
+* ``events`` (when event recording is enabled) — ordered
+  ``admit`` / ``wait`` / ``release`` records, including the requirements,
+  the resulting allocation and the waiters each admission bypassed;
+* the counters ``check_count``, ``admit_count`` and ``wait_count``.
+
+The default reporter output is unchanged when event recording is not
+enabled.
+
+
 targets
 -------
 

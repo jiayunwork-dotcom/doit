@@ -51,7 +51,8 @@ class Info(DoitCmdBase):
             ('params', 'list'),
             ('verbosity', 'scalar'),
             ('watch', 'list'),
-            ('meta', 'dict')
+            ('meta', 'dict'),
+            ('resources', 'dict')
         )
 
         self.outstream.write('\n{}\n'.format(task.name))

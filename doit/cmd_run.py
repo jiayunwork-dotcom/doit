@@ -9,6 +9,7 @@ from .control import TaskControl
 from .runner import Runner, MRunner, MThreadRunner
 from .cmd_base import DoitCmdBase
 from . import reporter
+from . import resources as resources_mod
 
 
 # verbosity
@@ -201,6 +202,14 @@ class Run(DoitCmdBase):
         # configure PythonAction
         PythonAction.pm_pdb = pdb
 
+        # validated resource configuration produced by DoitCmdBase.execute()
+        resource_limits = getattr(self, '_resource_limits', {})
+        resource_bypass_limit = getattr(
+            self, '_resource_bypass_limit',
+            resources_mod.DEFAULT_BYPASS_LIMIT)
+        resource_record_events = getattr(
+            self, '_resource_record_events', False)
+
         # get tasks to be executed
         # self.control is saved on instance to be used by 'auto' command
         self.control = TaskControl(self.task_list,
@@ -241,6 +250,11 @@ class Run(DoitCmdBase):
                 reporter_obj = reporter_cls
 
             stream = Stream(verbosity, force_verbosity)
+            resource_kwargs = dict(
+                resource_limits=resource_limits,
+                resource_bypass_limit=resource_bypass_limit,
+                resource_record_events=resource_record_events,
+            )
             run_args = [self.dep_manager, reporter_obj,
                         continue_, always, stream]
 
@@ -261,7 +275,7 @@ class Run(DoitCmdBase):
                     raise InvalidCommand(msg % par_type)
                 run_args.append(num_process)
 
-            runner = RunnerClass(*run_args)
+            runner = RunnerClass(*run_args, **resource_kwargs)
             return runner.run_all(self.control.task_dispatcher())
         finally:
             if isinstance(outfile, str):

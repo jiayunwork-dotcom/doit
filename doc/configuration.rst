@@ -206,3 +206,32 @@ it will have the same effect as executing
 
   Also if the command does not read the `dodo.py` file it obviously will
   not be used.
+
+
+resource capacity configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Two extra ``DOIT_CONFIG`` keys control capacity-aware task scheduling (see
+:ref:`task-resources` for the full semantics):
+
+``resource_limits``
+  a dictionary mapping resource names to their positive-integer capacity.
+  An empty dictionary is valid and means no resource has declared capacity;
+  omitting the option is treated the same way.  A task with a positive
+  requirement for an undeclared or over-capacity resource aborts the run.
+
+``resource_bypass_limit``
+  a non-negative integer (default ``3``) bounding how many times a later
+  task sharing a resource with an earlier waiting task may be admitted
+  ahead of it.  ``0`` disables overlapping queue jumping entirely; tasks
+  with disjoint requirements are never counted or blocked.
+
+Both values accept plain integers only — booleans are rejected — and the
+configured dictionaries are never modified.
+
+.. code-block:: python
+
+    DOIT_CONFIG = {
+        'resource_limits': {'memory_slots': 8, 'db_connections': 4},
+        'resource_bypass_limit': 2,
+    }

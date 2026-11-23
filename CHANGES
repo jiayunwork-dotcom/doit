@@ -13,6 +13,14 @@ Changes
 Unreleased
 ==========
 
+- Add capacity-aware resource scheduling.  Tasks may declare a ``resources``
+  dictionary of non-negative integer requirements; ``DOIT_CONFIG`` declares
+  ``resource_limits`` capacities and an optional ``resource_bypass_limit``
+  (default 3).  Capacity is committed in the parent process at dispatch time
+  and released once each task's result is processed (success, action failure
+  or save failure).  All-or-nothing allocation, bounded fairness bypasses and
+  disjoint-task progress are shared by the serial, process and thread
+  runners; ``-n`` still caps the total number of running tasks.
 - Add ``glob_dep``: pattern-based file dependencies expanded at run time.
   Supports ``*``, ``?``, ``[]`` and recursive ``**``, regular files only,
   directory symlinks are not followed and file symlinks are rejected.
