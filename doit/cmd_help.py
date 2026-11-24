@@ -64,6 +64,7 @@ getargs:
   - type: dictionary
     * key: string with the name of the function argument (used in a python-action)
     * value: tuple of (<task-name>, <variable-name>)
+      variable-name is a key of the saved values, or None for the whole dict
 
 teardown:
  - type: (list) of actions (see above)

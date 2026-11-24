@@ -370,12 +370,89 @@ by specifying the value name as ``None``.
 
 
 If a group-task is used, the values from all its sub-tasks are passed as a dict.
+Only the group's real sub-tasks take part in the mapping; external prerequisites
+(task dependencies / setup tasks of the group) are never folded into it.
+Adding or removing a sub-task changes the mapping and recomputes its consumers.
 
 .. literalinclude:: samples/getargs_group.py
 
 
 .. note::
    ``getargs`` creates an implicit setup-task.
+
+Incremental re-evaluation
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A task using ``getargs`` is re-run when the saved values it *actually selects*
+change.  The check is based on those values, not on the producing task's last
+action ``result``: a producer whose final action keeps returning the same value
+(for example a constant trailer/message) does not hide a change made by an
+earlier action.
+
+The comparison is canonical.  It does not depend on dictionary insertion order
+or object identity, lists stay ordered, a missing key is distinct from a key
+whose value is ``None``, and booleans are distinct from numbers.  Values must be
+canonical JSON: acyclic dictionaries/lists and JSON scalars, floats limited to
+finite values.  NaN and infinities are rejected.
+
+* A single-key selection (``('<task>', '<key>')``) reacts to that key only;
+  changes in other saved keys of the producer are still skipped.
+* A whole-dict selection (``('<task>', None)``) tracks every key and value of
+  the saved dictionary.
+* Rebinding the source task, the selected key, switching between single-key and
+  whole-dict selection, or changing the set of declared arguments invalidates
+  the previous success record.
+
+A declared task or key that does not exist is reported as a dependency error
+during delivery; it is never silently replaced with an old value.  Other
+dependencies (``file_dep``, ``task_dep``, ``uptodate``) keep participating
+exactly as before.  A task without an explicit ``task_dep`` still only runs its
+``getargs`` producer on demand through the implicit setup task; an up-to-date
+consumer does not probe the producer just to read a value.
+
+
+Value ownership
+~~~~~~~~~~~~~~~
+
+Each consumer receives its own copy of the selected values.  Mutating an
+argument inside an action affects only that action: it cannot change the
+producer's saved values, another consumer's arguments, or the success record
+that was already accepted.  Aliasing *within* a single argument is preserved;
+aliasing across separate arguments is not guaranteed.
+
+Only a fixed-size digest of the consumed values is stored as the success basis,
+so a wide value is not copied into the dependency database once per consumer.
+
+
+Storage and upgrade
+~~~~~~~~~~~~~~~~~~~
+
+The success basis persisted for a ``getargs`` consumer is a versioned digest
+(``v1:<sha256>``) of the canonical snapshot of exactly the values it consumed,
+including the task/key binding.  The full snapshot is transient: it lives only
+for the duration of one delivery.
+
+Why a digest rather than the full value: the snapshot would otherwise be
+written to the dependency database once per consumer, so a wide whole-dict
+value costs O(value) bytes *per consumer* and grows without bound as consumers
+are added.  The digest is constant (67 bytes) regardless of value width and
+consumer count, while still attesting to the delivered content.  Building the
+canonical document is the same cost either way; decoding it for delivery is
+done once per consumer at run time.
+
+An up-to-date check reads the producer's saved values once per check (the DB
+backend caches a task's decoded entry) and hashes the selected subset; it does
+not write anything.  Concurrent consumers each hold only their own delivered
+copy, so in-flight retention is bounded by the number of tasks running in
+parallel, not by the total number of consumers.
+
+An older database (or one written before this scheme) has no ``getargs:``
+basis for a consumer.  This is treated as "no reliable basis": the consumer is
+recomputed once and a fresh digest is stored, after which it is skipped as
+usual.  A failed consumer run never writes a new basis, so a retry recomputes
+against the values that will actually be delivered.  There is no new required
+task declaration; ``result_dep``, plain ``setup`` and tasks without ``getargs``
+keep their previous behaviour.
 
 
 .. _attr-calc_dep:

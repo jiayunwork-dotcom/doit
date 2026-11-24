@@ -11,6 +11,7 @@ from .exceptions import InvalidTask, BaseFail
 from .exceptions import TaskFailed, SetupError, DependencyError, UnmetDependency
 from .task import Stream, DelayedLoaded
 from .dependency import GlobDependencyChanged, observe_glob_state
+from .getargs import freeze, deliver
 from .globdep import GlobError
 
 
@@ -49,6 +50,9 @@ class Runner():
         self.teardown_list = []  # list of tasks to be teardown
         self.final_result = SUCCESS  # until something fails
         self._stop_running = False
+        # task mapping used to build getargs snapshots; kept so the success
+        # record can recompute a basis when a value was not delivered.
+        self._tasks_dict = {}
         # True inside a worker process/thread.  There the selection-time scan
         # done by the main process is stale and must not be attested.
         self._in_worker = False
@@ -74,29 +78,21 @@ class Runner():
 
 
     def _get_task_args(self, task, tasks_dict):
-        """get values from other tasks"""
+        """get values from other tasks
+
+        The snapshot is taken **once**, frozen, and used both to build the
+        private copies handed to the task's actions and to compute the success
+        basis persisted on a successful run.  The check done at selection time
+        and the delivered values therefore describe the same content.
+        """
         task.init_options()
-
-        def get_value(task_id, key_name):
-            """get single value or dict from task's saved values"""
-            if key_name is None:
-                return self.dep_manager.get_values(task_id)
-            return self.dep_manager.get_value(task_id, key_name)
-
-        # selected just need to get values from other tasks
-        for arg, value in task.getargs.items():
-            task_id, key_name = value
-
-            if tasks_dict[task_id].has_subtask:
-                # if a group task, pass values from all sub-tasks
-                arg_value = {}
-                base_len = len(task_id) + 1  # length of base name string
-                for sub_id in tasks_dict[task_id].task_dep:
-                    name = sub_id[base_len:]
-                    arg_value[name] = get_value(sub_id, key_name)
-            else:
-                arg_value = get_value(task_id, key_name)
-            task.options[arg] = arg_value
+        if not task.getargs:
+            return
+        task_basis, frozen = freeze(self.dep_manager, tasks_dict,
+                                    task.getargs)
+        task.options.update(deliver(frozen))
+        # persisted by process_task_result() -> save_success()
+        task.getargs_snapshot = task_basis
 
 
     def select_task(self, node, tasks_dict):
@@ -113,6 +109,7 @@ class Runner():
 
         # if run_status is not None, it was already calculated
         if node.run_status is None:
+            self._tasks_dict = tasks_dict
 
             self.reporter.get_status(task)
 
@@ -225,8 +222,10 @@ class Runner():
             # start observation is persisted: the newer content observed at
             # the end can never be recorded as "processed".
             try:
-                self.dep_manager.save_success(task,
-                                              glob_state=task.glob_state)
+                self.dep_manager.save_success(
+                    task, glob_state=task.glob_state,
+                    getargs_basis=task.getargs_snapshot,
+                    tasks_dict=self._tasks_dict)
             except FileNotFoundError as exception:
                 msg = (f"ERROR: Task '{task.name}' saving success: "
                        f"Dependent file '{exception.filename}' does not exist.")

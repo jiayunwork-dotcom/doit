@@ -75,7 +75,8 @@ to a task that has already run.
 
             task.values = values
             self.dep_manager.save_success(
-                task, result_hash=result, glob_state=task.glob_state)
+                task, result_hash=result, glob_state=task.glob_state,
+                tasks_dict=tasks)
             write("processed {}\n".format(task.name))
 
         self.dep_manager.close()

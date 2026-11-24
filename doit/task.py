@@ -12,6 +12,7 @@ from .cmdparse import CmdOption, TaskParse
 from .exceptions import BaseFail, InvalidTask
 from .action import create_action, PythonAction
 from .dependency import UptodateCalculator
+from .getargs import GETARGS_KEY, GetargsError, basis as getargs_basis
 from .globdep import normalize_patterns, normalize_path
 
 
@@ -239,6 +240,9 @@ class Task(object):
 
         self.getargs = getargs
         if self.getargs:
+            # getargs no longer relies on the producer's ``result`` (which a
+            # final action can keep unchanged).  A dedicated uptodate check
+            # compares the exact saved values this task consumes.
             uptodate.extend(self._init_getargs())
 
         self.value_savers = []
@@ -252,6 +256,9 @@ class Task(object):
         self.verbosity = verbosity
         self.custom_title = title
         self.cfg_values = None
+        # frozen getargs snapshot delivered to this run's actions (set by the
+        # runner); persisted verbatim as the success basis.
+        self.getargs_snapshot = None
 
         # clean
         if clean is True:
@@ -430,7 +437,7 @@ class Task(object):
 
     def _init_getargs(self):
         """task getargs attribute define implicit task dependencies"""
-        check_result = set()
+        check_result = []
 
         for arg_name, desc in self.getargs.items():
 
@@ -442,10 +449,17 @@ class Task(object):
                     "Should be tuple with 2 elements"
                     f" ('<taskid>', '<key-name>') got '{desc}'")
 
-            if parts[0] not in self.setup_tasks:
-                check_result.add(parts[0])
+            # the value name may be a string (single key) or None (whole dict)
+            if parts[1] is not None and not isinstance(parts[1], str):
+                raise InvalidTask(
+                    f"Taskid '{self.name}' - Invalid format for getargs of "
+                    f"'{arg_name}'. Key-name must be a string or None, "
+                    f"got {parts[1]!r}.")
 
-        return [result_dep(t, setup_dep=True) for t in check_result]
+            if parts[0] not in check_result:
+                check_result.append(parts[0])
+
+        return [getargs_dep(t, setup_dep=True) for t in check_result]
 
 
     @staticmethod
@@ -599,6 +613,10 @@ class Task(object):
         to_pickle['value_savers'] = None
         # can be re-recreated on demand
         to_pickle['_action_instances'] = None
+        # transient getargs state, recomputed by the process that needs it
+        for transient in ('_getargs_cache', '_getargs_cache_set',
+                          'getargs_snapshot'):
+            to_pickle.pop(transient, None)
         return to_pickle
 
     # when using multiprocessing Tasks are pickled.
@@ -614,6 +632,11 @@ class Task(object):
         del to_pickle['custom_title']
         del to_pickle['value_savers']
         del to_pickle['uptodate']
+        # transient getargs state: the main process owns the snapshot it will
+        # persist, workers do not need it.
+        for transient in ('_getargs_cache', '_getargs_cache_set',
+                          'getargs_snapshot'):
+            to_pickle.pop(transient, None)
         return to_pickle
 
     def update_from_pickle(self, pickle_obj):
@@ -731,3 +754,68 @@ class result_dep(UptodateCalculator):
         if last_success is None:
             return False
         return last_success == dep_result
+
+
+class getargs_dep(UptodateCalculator):
+    """check the exact saved values a task consumes through ``getargs``.
+
+    This replaces ``result_dep`` for ``getargs``: the producer's last action
+    result may legitimately stay unchanged while an earlier action's saved
+    value changes, and a task that only selects one key must not be
+    invalidated by other keys.
+
+    The canonical signature is created by :mod:`doit.getargs` from the values
+    stored for the selected task/key.  When a task runs, the runner passes the
+    same snapshot used for delivery, so the success basis and the arguments
+    that were actually handed to the actions cannot diverge.
+    """
+
+    def __init__(self, dep_task_name, setup_dep=True):
+        UptodateCalculator.__init__(self)
+        self.dep_name = dep_task_name
+        self.setup_dep = setup_dep
+        self.task_ref = None
+
+    def configure_task(self, task):
+        """create an implicit setup task (legacy getargs behaviour)"""
+        self.task_ref = task
+        if self.dep_name in task.setup_tasks:
+            return
+        if self.setup_dep:
+            task.setup_tasks.append(self.dep_name)
+        else:
+            task.task_dep.append(self.dep_name)
+
+    def current_signature(self, task):
+        """success basis of all selected values as currently saved.
+
+        ``get_status`` evaluates every ``getargs_dep`` of a task; they all look
+        at the same values.  Cache one computation per ``get_status`` call so a
+        wide value is serialised once, not once per source task.
+        """
+        if getattr(task, '_getargs_cache_set', False):
+            return task._getargs_cache
+        try:
+            current = getargs_basis(self._dep_manager, self.tasks_dict,
+                                    task.getargs)
+        except GetargsError:
+            current = None
+        task._getargs_cache = current
+        task._getargs_cache_set = True
+        return current
+
+    def setup(self, dep_manager, tasks_dict):
+        self._dep_manager = dep_manager
+        UptodateCalculator.setup(self, dep_manager, tasks_dict)
+
+    def __call__(self, task):
+        current = self.current_signature(task)
+        if current is None:
+            # a missing task/key makes the consumer run; the delivery path
+            # reports the real problem through the normal dependency error.
+            return False
+
+        # The success basis is the signature that was frozen when the values
+        # were delivered to this task's actions on the last successful run.
+        last_success = self.get_val(task.name, GETARGS_KEY)
+        return last_success is not None and last_success == current

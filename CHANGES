@@ -22,6 +22,19 @@ Unreleased
   The actual match set is injected as ``dependencies`` to actions.  Input
   changes during a task run invalidate the success record.
 
+- Fix ``getargs`` incremental re-evaluation.  A consumer's up-to-date status
+  is now based on the exact saved values it selects, so a producer whose
+  final action ``result`` stayed unchanged (e.g. a constant trailer) no
+  longer hides a change in an earlier action's value.  Selecting one key only
+  reacts to that key; ``None`` selects the whole dict and tracks every key and
+  value; group tasks track their member set.  Rebinding the source task, key
+  or whole-dict selection invalidates the old success record.  Values are
+  delivered as independent copies, so a consumer mutating its argument can no
+  longer change the producer's saved value, another consumer's input or an
+  already attested success basis.  Only a fixed-size digest of the consumed
+  snapshot is persisted.  Old databases without this basis recompute once and
+  then reuse it.
+
 
 0.36.0 (*2022-04-22*)
 =====================

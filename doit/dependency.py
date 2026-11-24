@@ -5,12 +5,16 @@ import hashlib
 import subprocess
 import inspect
 import json
+import copy
 from collections import defaultdict
 from dbm import dumb
 import dbm as ddbm
 
 from .globdep import (
     GlobError, GlobState, manifest_diff, normalize_path, scan_state,
+)
+from .getargs import (
+    GETARGS_KEY, derive_basis,
 )
 
 # uncomment imports below to run tests on all dbm backends...
@@ -571,7 +575,8 @@ class Dependency(object):
 
     ####### task specific
 
-    def save_success(self, task, result_hash=None, glob_state=None):
+    def save_success(self, task, result_hash=None, glob_state=None,
+                     getargs_basis=None, tasks_dict=None):
         """save info after a task is successfully executed
 
         :param str result_hash: explicitly set result_hash
@@ -581,9 +586,30 @@ class Dependency(object):
             "use the last observation made for this task" (or scan now when
             there is none), which is what direct users of ``save_success``
             (i.e. ``reset-dep``, tests) need.
+        :param getargs_basis: fixed-size success basis of the getargs values
+            that were actually delivered to the actions of this run.  When
+            ``None`` it is derived from the currently saved values (used by
+            ``reset-dep`` and direct API callers).  For a task without
+            getargs a stale basis is removed.
         """
-        # save task values
-        self._set(task.name, "_values_:", task.values)
+        # save task values.  Store a private copy: the backend keeps the
+        # object by reference until ``dump()``, so the saved value must not
+        # alias ``task.values`` (which may still be referenced by the action
+        # that produced it, or by a consumer's argument in the same process).
+        self._set(task.name, "_values_:", copy.deepcopy(task.values))
+
+        # save the getargs success basis.  It describes the saved values this
+        # task consumes; it must never be replaced by a value read after the
+        # consumer's actions mutated their copies.
+        if task.getargs:
+            if getargs_basis is None:
+                getargs_basis = derive_basis(
+                    self, tasks_dict if tasks_dict is not None else {},
+                    task.getargs)
+            self._set(task.name, GETARGS_KEY, getargs_basis)
+        elif self._get(task.name, GETARGS_KEY) is not None:
+            # getargs declaration was removed: drop the stale basis
+            self._set(task.name, GETARGS_KEY, None)
 
         # save task result md5
         if result_hash is not None:
@@ -725,10 +751,29 @@ class Dependency(object):
     def get_values(self, task_name):
         """get all saved values from a task
 
-        :return dict:
+        :return dict: a private copy, safe for the caller to mutate.
         """
         values = self._get(task_name, '_values_:')
-        return values or {}
+        if values is None:
+            return {}
+        # The DB backend caches decoded objects.  Hand out a copy so that
+        # mutating a returned value can never change what is stored, what
+        # another consumer receives, or an already attested success basis.
+        return copy.deepcopy(values)
+
+    def get_values_raw(self, task_name):
+        """get saved values without copying.
+
+        Internal read-only accessor used by getargs snapshot code.  Callers
+        must not mutate the returned object; use :func:`doit.getargs.deliver`
+        to obtain per-consumer copies.
+        """
+        values = self._get(task_name, '_values_:')
+        return values if values is not None else {}
+
+    def has_task(self, task_name):
+        """@return bool: the DB holds an entry for `task_name`"""
+        return bool(self._in(task_name))
 
     def get_value(self, task_id, key_name):
         """get saved value from task
@@ -786,6 +831,9 @@ class Dependency(object):
         task.dep_changed = []
         task.glob_state = None
         task.glob_files = None
+        # invalidate the per-check getargs signature cache
+        task._getargs_cache = None
+        task._getargs_cache_set = False
 
         # check uptodate bool/callables
         uptodate_result_list = []
@@ -837,6 +885,15 @@ class Dependency(object):
                 result.error_reason = str(exc)
                 result.add_reason('glob_dep_error', str(exc), 'error')
                 task.dep_changed = self._actual_inputs(task, None)
+                return result
+
+        # Check the getargs success basis.  A task that no longer declares
+        # getargs must not keep attesting values it used to consume: the old
+        # record is invalid, so run once (the basis is cleared on success).
+        # Tasks that still declare getargs are validated by their getargs_dep
+        # uptodate calculator, which compares the exact selection.
+        if not task.getargs and self._get(task.name, GETARGS_KEY) is not None:
+            if result.set_reason('getargs_removed', task.name):
                 return result
 
         # any uptodate check is false: run.  glob_dep was still observed above
